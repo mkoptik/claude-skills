@@ -19,12 +19,9 @@ still report anything Blocker- or High-severity found outside it.
 Establish the target before reviewing:
 
 ```
-gh pr view --json number,title,body,url,headRefName,baseRefName,headRefOid,headRepositoryOwner,headRepository,files,additions,deletions
+gh pr view --json number,title,body,url,headRefName,baseRefName,files,additions,deletions
 gh pr diff
 ```
-
-Keep `headRefOid` and the head owner/repo — they are needed to build permalinks in the
-output.
 
 Review the diff, not the files. Read surrounding context with `git show` or by reading
 the file when a hunk is unclear, but only report on lines this PR touches — except where
@@ -240,11 +237,11 @@ Substitute the GitHub login resolved at the top of this skill, keeping the leadi
 so it renders as a user link. Never post the comment with `<login>` unresolved.
 
 Follow it with the verdict paragraph, then an `###` heading per severity level present,
-then the findings as a numbered list. Each item leads with the headline in bold, then an
-em dash, then the permalink; the body follows on the next line:
+then the findings as a numbered list. Each item is the headline in bold, then an em dash,
+then the body on the same or next line:
 
 ```markdown
-4. **Unbounded result set loaded into memory** — [`path/to/file.py:142`](https://github.com/OWNER/REPO/blob/SHA/path/to/file.py#L142)
+4. **Unbounded result set loaded into memory** —
    <problem, consequence, and suggested fix in two or three sentences>
 ```
 
@@ -253,21 +250,15 @@ list items with explicit numbers (`4.`, `5.`) so GitHub renders the intended seq
 Omit severity levels with no findings. Keep it scannable — a reviewer reads this in a
 browser, not a terminal, and the bold headlines are what they skim.
 
-In the PR comment, every file reference is a permalink, not plain backticks. Build it
-from the values fetched at the start:
+Do not attach a location to a finding. The headline line is the headline and nothing else
+— no `path:line`, no filename, no permalink after the em dash. Write the body so the
+author knows which code it is about by naming the function, migration, or branch of the
+conditional; the console output carries the exact locations for whoever is working in the
+repo.
 
-```
-[`path/to/file.py:142`](https://github.com/<headRepositoryOwner>/<headRepository>/blob/<headRefOid>/path/to/file.py#L142)
-```
-
-- Pin the link to `headRefOid`, never to a branch name. A branch link rots the moment the
-  author pushes again; a commit permalink keeps pointing at the code the review was about.
-- For a finding spanning several lines, use a range anchor: `#L142-L149`.
-- For a line the PR *deletes*, there is no line in the head commit. Link the base commit
-  instead, or link the file without a line anchor and give the old line number in the text.
-- Keep the link text as the backticked `path:line` so the comment stays readable if
-  someone copies it out of GitHub. The headline carries the meaning; the link carries the
-  location.
+Links are still fine where one genuinely helps — the linked issue, a doc or spec, a prior
+PR, or a permalink to code *elsewhere* in the repo that the finding depends on. What is
+being dropped is the routine per-finding location stamp, not links in general.
 
 Print the comment body and ask for confirmation before posting. Post with
 `gh pr comment <number> --body-file <file>` only after the user approves. Never post
