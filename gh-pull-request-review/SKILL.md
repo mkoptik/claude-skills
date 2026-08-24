@@ -127,21 +127,171 @@ path reads correctly.
 
 # Security
 
-- Injection paths: SQL string interpolation, shell invocation with user input,
-  `shell=True`, path traversal in file operations, template injection, unsafe
-  deserialization (`pickle`, `yaml.load`, `eval`).
-- Authentication and authorization: new endpoints or handlers missing an authz check,
-  authorization decided on client-supplied identity, object-level permission checks
-  skipped on the read path.
+Trace every value that originated outside the process — request body, query string, path
+segment, header, cookie, webhook payload, uploaded file, message off a queue, a row
+written by another tenant — from where it enters to where it is used. A vulnerability is
+almost always an untrusted value reaching a sink that assumed it was trusted, so the
+question for each sink below is: could an attacker put their own value here?
+
+## Untrusted input and injection
+
+- SQL injection: string interpolation, f-strings, `+`, or `%` building a query;
+  `.raw()`/`execute()` with a formatted string; a table, column, or `ORDER BY` name taken
+  from a parameter. Parameterized queries are the fix, and note that placeholders bind
+  values only — an identifier or a whole clause coming from input still needs an
+  allowlist. Also flag a query built safely in one function and passed a pre-formatted
+  fragment by its caller.
+- Shell invocation with user input, `shell=True`, and template injection — the same
+  concatenation bug against a different parser.
+- CRLF injection: a `\r\n` in a value that becomes an HTTP header ends the header and
+  starts a new one — attacker-set cookies, injected CORS headers, or with a double CRLF an
+  attacker-controlled response body. Check redirect helpers, hand-rolled proxy code, and
+  anything writing raw bytes to a socket rather than assuming the framework rejects it. The
+  same character in a log line lets an attacker forge log entries or break the JSON a log
+  pipeline parses, dropping the surrounding real events; log the value as a structured
+  field instead of formatting it into the message.
+- Unsafe deserialization: `pickle.loads`, `yaml.load` without `SafeLoader`, `eval`, Java
+  `readObject`, .NET `BinaryFormatter`, PHP `unserialize`, Ruby `Marshal.load`. These
+  execute during parsing, before any validation of yours runs, so the format choice *is*
+  the security control — untrusted bytes reaching an object-graph deserializer is a
+  Blocker. It hides in a cache or session store, a queue broker configured with the pickle
+  serializer, `torch.load`/`read_pickle` on an uploaded file, and resume-from-checkpoint
+  paths.
+- Missing validation at the boundary generally: a handler that accepts a request body
+  with no schema, a parser that trusts declared length or content type, an integer parsed
+  without range checks, a value validated on the client and trusted on the server. Prefer
+  validate-then-use over sanitize-in-place; flag input that is checked once and mutated
+  afterwards.
+- Path traversal and file handling: `../` or an absolute path in any filename derived
+  from input, an upload whose name or content type decides where it lands or whether it
+  executes, archive extraction without checking entry paths (zip slip) or size
+  (decompression bomb).
+- Output encoding at the sink, chosen for the context: HTML body, attribute, JavaScript
+  string, URL, and shell all escape differently. Flag `innerHTML`,
+  `dangerouslySetInnerHTML`, `|safe`/`mark_safe`, and autoescape disabled on a template
+  fed anything user-controlled — including data that made a round trip through the
+  database, which is still user input.
+- Mass assignment: a model or struct populated wholesale from request data, letting a
+  caller set `role`, `tenant_id`, `is_admin`, `price`, or a foreign key that was never
+  meant to be writable. Look for an explicit allowlist of fields.
+- Type and parser confusion: a value that arrives as a string but is compared to a
+  number, JSON that parses differently in two services, a Unicode normalization or
+  case-folding step applied after a security check rather than before.
+
+## Authorization and multi-tenancy
+
+Treat tenant isolation as its own review pass, not a subcase of authentication. An
+authenticated caller who reads another tenant's row is a Blocker.
+
+- For every new or modified query, ask which clause restricts it to the caller's tenant.
+  A `WHERE id = :id` with no `tenant_id`/`org_id`/`workspace_id` predicate is a
+  cross-tenant read; the fact that the id is a UUID is not an access control.
+- Where does the tenant identifier come from? It must be derived from the session, token,
+  or verified claim — never from a request body, query parameter, header, or path segment
+  the caller controls. Flag any handler that accepts a `tenant_id` as input and uses it
+  in a lookup instead of comparing it to the authenticated one.
+- If isolation is enforced by a shared mechanism — a scoped repository, a base query
+  class, a row-level-security policy, request-scoped middleware — does this change go
+  through it, or does it open a raw connection, a background job, an admin client, or a
+  service account that bypasses it? New code that reaches for the unscoped client is the
+  usual way isolation breaks.
+- Objects reached indirectly still need the check: a child fetched by parent id, a record
+  loaded from a cache or search index, a file in object storage, an export or report, a
+  webhook replay, an id read out of a JWT body. Verify ownership of the object actually
+  being acted on, not of some ancestor.
+- Cross-tenant leakage through shared state: a cache key or memoization without the
+  tenant in it, a connection or client pool holding one tenant's credentials, a rate
+  limiter or counter keyed globally, a tenant id set on a thread-local or context var and
+  not cleared, an async task that inherits the wrong context.
+- Missing or weakened authorization more broadly: a new route with no authz decorator or
+  middleware, an authz check performed after the side effect, a check on the write path
+  only, an internal endpoint assumed unreachable, an authorization decision made from
+  client-supplied identity or from a role in a request field.
+- Ordering and enumeration: does a not-found for someone else's object return 404 rather
+  than 403, and does an error message distinguish "does not exist" from "not yours"?
+  Also flag sequential ids newly exposed in URLs or responses.
+- Tests: a cross-tenant test that asserts the request is refused is the only cheap proof
+  isolation works. Its absence on a new data-access path is a finding.
+
+## Outbound requests and SSRF
+
+Any HTTP, DNS, or socket call whose destination is influenced by input is a candidate SSRF.
+
+- Where does the URL come from? A user-supplied webhook target, avatar or image URL,
+  "import from link", PDF or screenshot renderer, OpenAPI/schema fetcher, OIDC discovery
+  document, S3 or Git remote, proxy parameter, or a URL taken from a database record that
+  a user wrote earlier.
+- Cloud metadata and internal reach: does the code prevent requests to `169.254.169.254`,
+  link-local and loopback addresses, RFC1918 ranges, `.internal`/cluster-local DNS names,
+  and non-HTTP schemes (`file://`, `gopher://`, `dict://`)? An outbound call from inside
+  the network perimeter is a credential-theft path, not just a fetch.
+- Validation that does not hold: a blocklist of hostnames, a check on the string before
+  redirects are followed, DNS resolved once for the check and again for the connect
+  (rebinding). The check has to be on the resolved IP of every hop, with redirects
+  disabled or re-validated, and an allowlist beats a blocklist.
+- Blind SSRF still matters: timing, response size, and error differences leak whether an
+  internal host exists even when the body is discarded.
+- Also flag the SSRF-adjacent shapes: open redirect from a `next`/`return_to` parameter,
+  a fetch whose response is parsed as XML with external entities enabled (XXE), and a
+  client that disables TLS verification (`verify=False`, `InsecureSkipVerify`,
+  `rejectUnauthorized: false`) to make an internal call work.
+
+## Identity, sessions, and crypto
+
+- Token verification: signature actually checked, algorithm pinned (`alg: none` and
+  RS256→HS256 confusion rejected), `exp`/`nbf`/`aud`/`iss` validated, key looked up from
+  a trusted source rather than the token's own `kid`/`jku`.
+- Session handling: fixation on privilege change, missing invalidation on logout or
+  password reset, cookies without `HttpOnly`/`Secure`/`SameSite`, tokens in URLs or logs,
+  long-lived refresh tokens with no revocation path.
+- CSRF on state-changing requests that authenticate by cookie, state-changing operations
+  exposed over `GET`, and CORS set to reflect the `Origin` header or `*` together with
+  credentials.
+- Webhook and callback authenticity: signature verified over the raw body, timestamp
+  checked to stop replay, comparison done in constant time. An unauthenticated callback
+  that mutates state is a Blocker.
+- Crypto misuse: home-rolled primitives, ECB or a static/reused IV, MD5/SHA-1 or a plain
+  hash for passwords instead of bcrypt/argon2/scrypt, `math/rand`/`random` for tokens or
+  ids instead of a CSPRNG, `==` on secrets and MACs instead of a constant-time compare,
+  encrypt-without-authenticate, secrets derived from something guessable.
 - Secrets: credentials, tokens, keys, or internal hostnames in code, config, tests, or
-  fixtures. Also flag secrets in logs and error messages.
-- Input validation and output encoding at trust boundaries, including anything crossing
-  the network or entering a template.
-- Dependency changes: new or upgraded dependencies, what they pull in transitively,
-  whether the addition is warranted. Flag a new dependency that replaces a handful of
-  lines of standard library.
+  fixtures — and in logs, error messages, and exception payloads. A test fixture with a
+  real-looking key gets flagged.
+
+## Abuse, exhaustion, and exposure
+
+- Rate limiting and brute force on new authentication, password reset, invite, OTP, or
+  expensive endpoints; enumeration through differing responses or timings.
+- Denial of service through input: unbounded pagination or page size, a regex with
+  catastrophic backtracking on user input (ReDoS), an unbounded upload or request body,
+  recursive JSON/XML depth, GraphQL query depth and aliasing, an `IN` clause built from a
+  caller-sized list.
+- Business-logic race conditions with a security consequence: double-spend on a balance,
+  redeeming a coupon or invite twice, TOCTOU between an authorization check and the
+  write. Ask whether the guard holds under two concurrent requests, not one.
+- Information disclosure: stack traces, SQL text, internal hostnames, or object ids in
+  responses; debug mode or verbose errors enabled by config default; a new field in a
+  serializer that exposes more of the model than intended; an error message that
+  distinguishes valid from invalid accounts.
 - Sensitive data handling: PII in logs, over-broad log levels on request bodies, data
-  retained longer than the change implies.
+  retained longer than the change implies, sensitive values in analytics events, URLs, or
+  cache keys.
+- Caching and CDN: an authenticated or tenant-scoped response made cacheable, a cache key
+  missing the identity dimension, `Vary` omitted — one user's data served to another.
+
+## Configuration and supply chain
+
+- Insecure defaults introduced by the change: permissive CORS, a wildcard host, an open
+  bind address, authentication disabled in a config sample that gets copied, a feature
+  flag defaulting open, a container running as root, an IAM policy or bucket ACL widened
+  beyond what the change needs.
+- Dependency changes: new or upgraded dependencies, what they pull in transitively,
+  whether the addition is warranted, whether the version is pinned and the lockfile
+  consistent. Flag a new dependency that replaces a handful of standard-library lines,
+  a package name close to a well-known one (typosquat), and an install-time script.
+- CI and build changes: a workflow given more permissions or secrets than it needs, an
+  action pinned to a mutable tag, `pull_request_target` with a checkout of untrusted
+  code, a secret exposed to a fork-triggered job.
 
 # Readability and conventions
 
